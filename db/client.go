@@ -1,7 +1,7 @@
 package db
 
 import (
-	"github.com/google/uuid"
+	"github.com/satori/go.uuid"
 	"github.com/spf13/viper"
 	"kiritoabc/raft-kv-db/pkg/log"
 	"kiritoabc/raft-kv-db/rpcutil"
@@ -11,9 +11,9 @@ import (
 // ClientConfig 客户端配置
 type ClientConfig struct {
 	ClientEnd []struct {
-		Ip   string
-		Port string
-	} `yaml:"servers"`
+		Ip   string `yaml:"ip"`
+		Port string `yaml:"port"`
+	} `yaml:"clientEnd"`
 }
 
 // KVClient 客户端维护的一些数据
@@ -27,7 +27,7 @@ type KVClient struct {
 
 // generateUUID 生成一个全局唯一的ID
 func generateUUID() uuid.UUID {
-	id := uuid.New()
+	id := uuid.NewV1()
 	return id
 }
 
@@ -155,18 +155,17 @@ func GetClientEnds(path string) []*rpcutil.ClientEnd {
 
 // getClientConfig 获取客户端配置
 func getClientConfig(path string) *ClientConfig {
-	cfg := ClientConfig{}
-	if len(os.Args) == 2 {
+	if len(os.Args) != 1 {
 		path = os.Args[1]
 	}
-
-	// 读取配置文件
+	log.Log.Infof("installing config %s", path)
+	cfg := ClientConfig{}
 	viper.SetConfigFile(path)
 	if err := viper.ReadInConfig(); err != nil {
-		log.Log.Fatal(err)
+		log.Log.Fatalf("read config failed: %v", err)
 	}
 	if err := viper.Unmarshal(&cfg); err != nil {
-		log.Log.Fatal(err)
+		log.Log.Fatalf("unmarshal config failed: %v", err)
 	}
 	return &cfg
 }

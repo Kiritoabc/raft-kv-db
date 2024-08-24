@@ -1,106 +1,124 @@
 package main
 
 import (
-	"github.com/spf13/viper"
+	"bufio"
 	"kiritoabc/raft-kv-db/db"
-	"kiritoabc/raft-kv-db/pkg/log"
-	"kiritoabc/raft-kv-db/raft"
-	"kiritoabc/raft-kv-db/rpcutil"
-	"net"
-	"net/http"
-	"net/rpc"
+	"log"
 	"os"
+	"strings"
 )
 
-// Config 配置文件结构体Config
-type Config struct {
-	// 服务器的Ip和对应的Port
-	Servers []struct {
-		Ip   string
-		Port string
-	}
-	Me int `yaml:"me"`
+type Command struct {
+	Name   string
+	Num    int
+	Action func(args []string)
 }
 
-const path = "config/server.yaml"
+const (
+	EXIT   = "exit"
+	TIP    = "> "
+	GET    = "get"
+	APPEND = "append"
+	PUT    = "put"
+	ILLAGM = "illegal argument"
+	// 指示客户端的命令
+	HUMEN = `Commands:
+	"get k"
+	"append k v"
+	"put k v"
+	"exit"
+`
+)
 
 func main() {
-	// 首先解析cfg文件
-	serverCfg := getCfg(path)
-	i := len(serverCfg.Servers)
-	if (i & 1) == 0 {
-		panic("总服务器数量必须为单数")
+	// 获取服务器列表
+	clientEnds := db.GetClientEnds("example/config/client.yml")
+
+	// 生成一个客户端实例
+	Client := db.NewKVClient(clientEnds)
+
+	// 命令的种类
+	commands := []*Command{
+		{
+			// GET命令
+			Name: GET,
+			Num:  2, // 参数个数
+			Action: func(args []string) {
+				println(Client.Get(args[1]))
+			},
+		},
+		{
+			Name: APPEND,
+			Num:  3,
+			Action: func(args []string) {
+				Client.Append(args[1], args[2])
+			},
+		},
+		{
+			Name: PUT,
+			Num:  3,
+			Action: func(args []string) {
+				Client.Put(args[1], args[2])
+			},
+		},
 	}
 
-	// 获取集群的所有服务器列表
-	clientEnds := getClientEnds(serverCfg)
-	// 持久化工具
-	persister := raft.NewPersister()
-	// 获取一个kvserver实例
-	kvur := db.StartKVServer(clientEnds, serverCfg.Me, persister, i)
+	// 输出命令格式
+	println(HUMEN)
+	// 循环读取命令行的命令
+	for line := readLine(); !strings.EqualFold(line, EXIT); {
+		// 将从命令行读取的数据参数进行解析, 解析具体的参数
+		args := parseArgs(line)
+		if len(args) > 0 {
+			name := args[0]
+			do := false
+			// 遍历commands种类, 匹配具体的命令
+			for _, command := range commands {
+				if command.Name != name {
+					continue
+				}
 
-	// 首先将kvur进行注册，注册之后的方法才可以进行RPC调用
-	// 使用rpc.Register进行注册
-	if err := rpc.Register(kvur); err != nil {
-		panic(err)
-	}
+				do = true
+				if len(args) != command.Num {
+					println(ILLAGM + HUMEN)
+					continue
+				}
+				command.Action(args)
+			}
 
-	// 注册 HTTP 路由
-	rpc.HandleHTTP()
-	// 监听端口
-	l, e := net.Listen("tcp", ":"+serverCfg.Servers[serverCfg.Me].Port)
-	if e != nil {
-		panic(e)
-	}
-	log.Log.Infof("Listen", serverCfg.Servers[serverCfg.Me].Port)
-
-	// 启动一个Http服务，请求rpc的方法会交给rpc内部路由进行处理
-	log.Log.Fatal(http.Serve(l, nil))
-}
-
-func getClientEnds(serverCfg Config) []*rpcutil.ClientEnd {
-	// 创建clientEnds数组，初始长度为0
-	clientEnds := make([]*rpcutil.ClientEnd, 0)
-	// 遍历所有server
-	for i, end := range serverCfg.Servers {
-		// server的地址: IP:PORT
-		address := end.Ip + ":" + end.Port
-		var client *rpc.Client
-		if i == serverCfg.Me {
-			client = nil
-		} else {
-			// 如果不是自身，则尝试与别的服务器进行进行连接
-			client, _ = rpcutil.TryConnect(address)
+			if !do {
+				println(HUMEN)
+			}
 		}
 
-		// 新建一个ClientEnd服务器
-		tmpClientEnd := &rpcutil.ClientEnd{
-			Addr:   address,
-			Client: client,
-		}
-
-		clientEnds = append(clientEnds, tmpClientEnd)
+		// 从命令行读取数据
+		line = readLine()
 	}
-	return clientEnds
 }
 
-// getCfg 获取配置文件
-func getCfg(path string) Config {
-	cfg := Config{}
-	// 如果没有指定config文件的地址，则使用默认的config文件
-	if len(os.Args) != 1 {
-		path = os.Args[1]
+// 解析命令行参数
+func parseArgs(line string) []string {
+	// 将参数按照空格进行划分
+	argsT := strings.Split(line, " ")
+	args := make([]string, 0)
+	// 将命令添加到返回参数args中
+	for _, str := range argsT {
+		if !strings.EqualFold(str, " ") && !strings.EqualFold(str, "") {
+			args = append(args, str)
+		}
 	}
+	return args
+}
 
-	// 读取文件
-	viper.SetConfigFile(path)
-	if err := viper.ReadInConfig(); err != nil {
-		log.Log.Fatalf("Error reading config file, %s", err)
+// 从命令行读取具体的命令
+func readLine() string {
+	// 创建一个IO读写缓存
+	reader := bufio.NewReader(os.Stdin)
+	print(TIP)
+	// 从命令行读取命令
+	answer, _, err := reader.ReadLine()
+	if err != nil {
+		log.Fatal(err)
 	}
-
-	if err := viper.Unmarshal(&cfg); err != nil {
-		log.Log.Fatalf("Unable to decode into struct, %v", err)
-	}
-
-	return cfg
+	return strings.TrimSpace(string(answer))
 }

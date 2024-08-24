@@ -1,11 +1,16 @@
 package db
 
 import (
-	"github.com/google/uuid"
+	"fmt"
+	"github.com/satori/go.uuid"
+	"kiritoabc/raft-kv-db/labgob"
 	"kiritoabc/raft-kv-db/pkg/log"
 	"kiritoabc/raft-kv-db/raft"
 	"kiritoabc/raft-kv-db/rpcutil"
+	"net/rpc"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // Op command定义 是客户端发送给Raft的命令
@@ -61,11 +66,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) error {
 
 // KVServer 实现了KVServer接口
 type KVServer struct {
-	mu sync.Mutex
-	me int // 当前节点的索引号
-	//rf      *raft.Raft         // 当前节点对应的Raft实例
-	//applyCh chan raft.ApplyMsg // Apply通道，用来执行命令
-	dead int32
+	mu      sync.Mutex
+	me      int                // 当前节点的索引号
+	rf      *raft.Raft         // 当前节点对应的Raft实例
+	applyCh chan raft.ApplyMsg // Apply通道，用来执行命令
+	dead    int32
 
 	maxraftstate int // 如果日志变得很长，就备份一份快照
 
@@ -75,5 +80,145 @@ type KVServer struct {
 
 // StartKVServer starts the server for a KV group.
 func StartKVServer(servers []*rpcutil.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
+	// Go's RPC library to marshall/unmarshall.
+	labgob.Register(Op{})
 
+	// 新建一个KVServer实例
+	kv := new(KVServer)
+	kv.me = me
+	kv.maxraftstate = maxraftstate
+
+	// 新建一个ApplyMsg通道, 用于Apply命令的传送
+	kv.applyCh = make(chan raft.ApplyMsg)
+	// 调用Make函数来创建一个Raft节点实例(Make函数中会创建几个goroutine来进行leader选举以及日志的复制)
+	kv.rf = raft.NewRaft(servers, me, persister, kv.applyCh)
+	// 存放数据的字典
+	kv.data = make(map[string]string)
+	// 命令执行的返回值
+	kv.commonReplies = make([]*CommonReply, 1)
+
+	// 调用Register函数注册RPC函数
+	if err := rpc.Register(kv.rf); err != nil {
+		panic(err)
+	}
+
+	// 创建一个协程来处理Apply到数据库的操作
+	go kv.opHandler()
+
+	return kv
+}
+
+func (kv *KVServer) opHandler() {
+	// for循环不断进行操作
+	for {
+		if kv.killed() {
+			return
+		}
+
+		// 从applyCh通道中获取Apply的命令
+		// 如果通道里面没有数据了, 就会阻塞住
+		applyMsg := <-kv.applyCh
+		// 获取具体的命令
+		op := applyMsg.Command.(Op)
+		reply := &CommonReply{
+			Key:    op.Key,
+			Value:  op.Value,
+			Serial: &op.Serial,
+		}
+		if op.Type == OpPut { // put key value操作
+			kv.data[op.Key] = op.Value
+			reply.Err = OK
+		} else if op.Type == OpAppend { // append key value操作
+			if _, has := kv.data[op.Key]; has {
+				kv.data[op.Key] += op.Value
+			} else {
+				kv.data[op.Key] = op.Value
+			}
+			reply.Err = OK
+		} else if op.Type == OpGet { // get key操作
+			if value, ok := kv.data[op.Key]; ok {
+				reply.Value = value
+				reply.Err = OK
+			} else { // 不存在key
+				reply.Err = ErrNoKey
+			}
+		} else {
+			panic(fmt.Sprintf("%v: Get 命令中 op.Type 的值 %v 错误，附 op 的值 {Key=%v Value=%v}",
+				kv.me, op.Type, op.Key, op.Value))
+		}
+
+		func() {
+			kv.mu.Lock()
+			defer kv.mu.Unlock()
+			// 将对应的reply加到commonReplies后面
+			kv.commonReplies = append(kv.commonReplies, reply)
+		}()
+	}
+}
+
+func (kv *KVServer) findReply(op *Op, idx int, reply *CommonReply) string {
+	t0 := time.Now()
+	// 设置一个超时时间, 如果超过这个时间表示提交失败(超时)
+	for time.Since(t0).Seconds() < 2 {
+		kv.mu.Lock()
+		if len(kv.commonReplies) > idx {
+			// 根据idx来获取对应的commonReply数据
+			if op.Serial == *kv.commonReplies[idx].Serial {
+				reply1 := kv.commonReplies[idx]
+				reply.Err = reply1.Err
+				reply.Key = reply1.Key
+				reply.Value = reply1.Value
+				kv.mu.Unlock()
+				return OK
+			} else {
+				kv.mu.Unlock()
+				return CommitTimeout
+			}
+		}
+		kv.mu.Unlock()
+		// sleep一定时间, 等待Apply完成
+		time.Sleep(20 * time.Millisecond)
+	}
+	return CommitTimeout
+}
+
+// PutAppend 接口, 供client进行RPC通信
+func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+	op := &Op{
+		Type:   args.Op,
+		Key:    args.Key,
+		Value:  args.Value,
+		Serial: args.Serial,
+	}
+	reply.Err = ErrWrongLeader
+	// kv.rf.Strat(*op)函数执行具体的命令
+	idx, _, isLeader := kv.rf.Start(*op)
+	if !isLeader {
+		log.Log.Infof("%v 对于 %v 的 %v 请求 {Key=%v Serial=%v Value='%v'} 处理结果为 该服务器不是领导者",
+			kv.me, args.Id, args.Op, args.Key, args.Serial, args.Value)
+		return nil
+	}
+	fmt.Printf("%v 等待对 %v 的 %v 请求 {Key=%v Serial=%v Value='%v'} 的提交，应提交索引为 %v\n",
+		kv.me, args.Id, args.Op, args.Key, args.Serial, args.Value, idx)
+
+	commonReply := &CommonReply{}
+	// 查找对应的commonReply
+	find := kv.findReply(op, idx, commonReply)
+	if find == OK {
+		reply.Err = commonReply.Err
+	}
+	log.Log.Infof("%v 对于 %v 的 %v 请求 {Key=%v Serial=%v Value='%v'} 处理结果为 %v\n",
+		kv.me, args.Id, args.Op, args.Key, args.Serial, args.Value, reply.Err)
+
+	return nil
+}
+
+func (kv *KVServer) Kill() {
+	atomic.StoreInt32(&kv.dead, 1)
+	kv.rf.Kill()
+}
+
+func (kv *KVServer) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
 }

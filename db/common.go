@@ -1,6 +1,6 @@
 package db
 
-import "github.com/google/uuid"
+import "github.com/satori/go.uuid"
 
 const (
 	OK             = "OK"

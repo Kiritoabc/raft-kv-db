@@ -13,15 +13,15 @@ import (
 )
 
 // config 配置文件路径
-const config = "config/server.yaml"
+const config = "example/config/server1.yml"
 
 // Config 配置文件结构体Config
 type Config struct {
 	// 服务器的Ip和对应的Port
 	Servers []struct {
-		Ip   string
-		Port string
-	}
+		Ip   string `yaml:"ip"`
+		Port string `yaml:"port"`
+	} `yaml:"servers"`
 	Me int `yaml:"me"`
 }
 
